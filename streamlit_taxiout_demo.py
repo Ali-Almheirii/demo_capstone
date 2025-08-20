@@ -4,7 +4,7 @@
 # Taxi‑Out Prediction Demo (Refactor: Core-only inputs + Preset Week)
 # --------------------------------------------------------------
 # - Frontend only captures core fields; engineered features are computed by backend
-# - Preset Week mode: browse 30-min bins, select a bin, and predict
+# - Preset Week mode: browse 10-min bins, select a bin, and predict
 # - Manual Scenario mode: set core fields and explicit timestamp and predict
 #
 # How to run:
@@ -26,7 +26,11 @@ import streamlit as st
 import requests
 import altair as alt
 
-st.set_page_config(page_title="Taxi‑Out Prediction Demo", layout="wide")
+st.set_page_config(
+    page_title="Taxi‑Out Prediction Demo", 
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
 
 # -----------------------------
 # Constants and helpers
@@ -57,10 +61,10 @@ def safe_to_datetime(val: str) -> pd.Timestamp:
 
 
 @st.cache_data(show_spinner=False)
-def fetch_week_overview(api_base: str, airport: str, start_date: str, end_date: str) -> Optional[Dict[str, Any]]:
+def fetch_day_overview(api_base: str, date: str) -> Optional[Dict[str, Any]]:
     try:
-        url = f"{api_base.rstrip('/')}/traffic/week"
-        resp = requests.get(url, params={"airport": airport, "start": start_date, "end": end_date}, timeout=10)
+        url = f"{api_base.rstrip('/')}/traffic/day"
+        resp = requests.get(url, params={"date": date}, timeout=10)
         if resp.status_code == 200:
             return resp.json()
         return None
@@ -116,10 +120,13 @@ def make_week_chart(df_bins: pd.DataFrame, states_to_show: List[str]) -> alt.Cha
     if data.empty:
         return alt.Chart(pd.DataFrame({"x": [], "y": []})).mark_bar()
 
-    base = alt.Chart(data).encode(
-        x=alt.X("bin_start:T", title="Time"),
-        x2=alt.X2("bin_end:T"),
-        y=alt.Y("departures_count:Q", title="Departures (30m)"),
+    # For line chart, we need to use bin center as x-axis
+    data_with_center = data.copy()
+    data_with_center['bin_center'] = data_with_center['bin_start'] + (data_with_center['bin_end'] - data_with_center['bin_start']) / 2
+    
+    base = alt.Chart(data_with_center).encode(
+        x=alt.X("bin_center:T", title="Time"),
+        y=alt.Y("departures_count:Q", title="Departures (10m)"),
         color=alt.Color("state:N", scale=alt.Scale(domain=list(STATE_PALETTE.keys()), range=list(STATE_PALETTE.values()))),
         tooltip=[
             alt.Tooltip("bin_start:T", title="Start"),
@@ -129,7 +136,26 @@ def make_week_chart(df_bins: pd.DataFrame, states_to_show: List[str]) -> alt.Cha
         ],
     )
 
-    chart = base.mark_bar().properties(height=220).interactive()
+    # Create trend-focused chart with smoother lines and smaller points
+    line_chart = base.mark_line(strokeWidth=2.5, opacity=0.8).properties(height=450)
+    point_chart = base.mark_circle(size=40, strokeWidth=1.5, opacity=0.9).properties(height=450)
+    
+    # Combine line and points for better interaction
+    chart = alt.layer(line_chart, point_chart).properties(
+        title="Daily Departure Trends"
+    ).configure_axis(
+        gridColor='#e0e0e0',
+        gridOpacity=0.2,
+        labelFontSize=11,
+        titleFontSize=13
+    ).configure_view(
+        strokeWidth=0
+    ).configure_legend(
+        orient='top',
+        titleFontSize=12,
+        labelFontSize=10
+    ).interactive()
+    
     return chart
 
 
@@ -174,49 +200,234 @@ with st.sidebar:
     
     if dist_data:
         stats = dist_data.get("distribution_stats", {})
+        histogram_data = dist_data.get("histogram_data", [])
         mean = stats.get("mean", 0)
         std = stats.get("std", 1)
         
-        # Create normal distribution plot
-        x = np.linspace(max(0, mean - 4*std), mean + 4*std, 100)
-        y = (1/(std * np.sqrt(2 * np.pi))) * np.exp(-0.5 * ((x - mean) / std) ** 2)
+        if histogram_data:
+            # Create DataFrame from real histogram data
+            df_hist = pd.DataFrame(histogram_data)
+            df_hist['bin_center'] = (df_hist['bin_start'] + df_hist['bin_end']) / 2
+            
+            # Create smooth curve using better interpolation and smoothing
+            x_points = df_hist['bin_center'].tolist()
+            y_points = df_hist['count'].tolist()
+            
+            if x_points and y_points:
+                # Create more natural curve using cubic spline interpolation
+                from scipy.interpolate import CubicSpline
+                from scipy.ndimage import gaussian_filter1d
+                
+                # Add padding points for better curve behavior at edges
+                x_padded = [0] + x_points + [df_hist['bin_end'].iloc[-1]]
+                y_padded = [0] + y_points + [0]
+                
+                # Create cubic spline interpolation
+                cs = CubicSpline(x_padded, y_padded, bc_type='natural')
+                
+                # Generate smooth curve with more points
+                x_smooth = np.linspace(0, df_hist['bin_end'].iloc[-1], 500)  # More points for smoother curve
+                y_smooth = cs(x_smooth)
+                
+                # Apply Gaussian smoothing to remove any remaining artifacts
+                y_smooth = gaussian_filter1d(y_smooth, sigma=2)
+                
+                # Ensure non-negative values
+                y_smooth = np.maximum(y_smooth, 0)
+                
+                # Create DataFrame for smooth curve
+                df_smooth = pd.DataFrame({
+                    'taxi_time': x_smooth,
+                    'count': y_smooth
+                })
+                
+                # Base chart for smooth curve
+                base = alt.Chart(df_smooth).encode(
+                    x=alt.X('taxi_time:Q', title='Taxi-Out Time (minutes)', 
+                           scale=alt.Scale(domain=[0, df_hist['bin_end'].iloc[-1]])),
+                    y=alt.Y('count:Q', title='Number of Flights'),
+                    tooltip=[
+                        alt.Tooltip('taxi_time:Q', title='Time (min)', format='.1f'),
+                        alt.Tooltip('count:Q', title='Flights', format='.0f')
+                    ]
+                )
+                
+                # Smooth area chart
+                area = base.mark_area(
+                    fill='#4CAF50',
+                    fillOpacity=0.6,
+                    stroke='#2E7D32',
+                    strokeWidth=2,
+                    interpolate='monotone'  # Smooth interpolation
+                )
+                
+                # Line overlay for better definition
+                line = base.mark_line(
+                    color='#2E7D32',
+                    strokeWidth=2,
+                    interpolate='monotone'
+                )
+                
+                chart_layers = [area, line]
+            else:
+                # Fallback if no data
+                chart_layers = []
+            
+            # Mean line
+            mean_rule = alt.Chart(pd.DataFrame({'mean': [mean]})).mark_rule(
+                color='#FF5722',
+                strokeWidth=3,
+                strokeDash=[5, 5]
+            ).encode(x='mean:Q')
+            
+            # Percentile lines with legend
+            percentiles = stats.get("percentiles", {})
+            percentile_rules = []
+            percentile_colors = ['#2196F3', '#FF9800', '#9C27B0']
+            percentile_names = ['25th', '50th', '75th']
+            
+            for i, (pct, val) in enumerate(percentiles.items()):
+                if i < len(percentile_colors):
+                    rule = alt.Chart(pd.DataFrame({'value': [val], 'percentile': [percentile_names[i]]})).mark_rule(
+                        color=percentile_colors[i],
+                        strokeWidth=2,
+                        strokeDash=[3, 3] if i == 0 else [1, 1] if i == 1 else [6, 2]
+                    ).encode(
+                        x='value:Q',
+                        color=alt.Color('percentile:N', scale=alt.Scale(
+                            domain=percentile_names,
+                            range=percentile_colors
+                        ))
+                    )
+                    percentile_rules.append(rule)
+            
+            # Combine all layers
+            chart = alt.layer(*chart_layers, mean_rule, *percentile_rules).properties(
+                title='Taxi-Out Time Distribution (Real Data)',
+                width='container',
+                height=500
+            ).configure_axis(
+                gridColor='#e0e0e0',
+                gridOpacity=0.3,
+                labelFontSize=11,
+                titleFontSize=13
+            ).configure_axisY(
+                format='.0s'  # Short format: 1K, 2K, etc. instead of 1000, 2000
+            ).configure_view(
+                strokeWidth=0
+            ).configure_legend(
+                orient='top',
+                titleFontSize=12,
+                labelFontSize=10
+            )
+        else:
+            # Fallback to theoretical distribution if no histogram data
+            x = np.linspace(max(0, mean - 4*std), mean + 4*std, 200)
+            y = (1/(std * np.sqrt(2 * np.pi))) * np.exp(-0.5 * ((x - mean) / std) ** 2)
+            
+            df_dist = pd.DataFrame({
+                'taxi_time': x,
+                'frequency': y
+            })
+            
+            base = alt.Chart(df_dist).encode(
+                x=alt.X('taxi_time:Q', title='Taxi-Out Time (minutes)', scale=alt.Scale(domain=[max(0, mean - 4*std), mean + 4*std])),
+                y=alt.Y('frequency:Q', title='Frequency', scale=alt.Scale(domain=[0, max(y) * 1.1]))
+            )
+            
+            area = base.mark_area(
+                fill='#4CAF50',
+                fillOpacity=0.6,
+                stroke='#2E7D32',
+                strokeWidth=2
+            )
+            
+            line = base.mark_line(
+                color='#2E7D32',
+                strokeWidth=3
+            )
+            
+            mean_rule = alt.Chart(pd.DataFrame({'mean': [mean]})).mark_rule(
+                color='#FF5722',
+                strokeWidth=3,
+                strokeDash=[5, 5]
+            ).encode(x='mean:Q')
+            
+            percentiles = stats.get("percentiles", {})
+            percentile_rules = []
+            percentile_colors = ['#2196F3', '#FF9800', '#9C27B0']
+            
+            for i, (pct, val) in enumerate(percentiles.items()):
+                if i < len(percentile_colors):
+                    rule = alt.Chart(pd.DataFrame({'value': [val]})).mark_rule(
+                        color=percentile_colors[i],
+                        strokeWidth=2,
+                        strokeDash=[3, 3] if i == 0 else [1, 1] if i == 1 else [6, 2]
+                    ).encode(x='value:Q')
+                    percentile_rules.append(rule)
+            
+            chart = alt.layer(area, line, mean_rule, *percentile_rules).properties(
+                title='Taxi-Out Time Distribution (Theoretical)',
+                width='container',
+                height=500
+            ).configure_axis(
+                gridColor='#e0e0e0',
+                gridOpacity=0.3,
+                labelFontSize=11,
+                titleFontSize=13
+            ).configure_axisY(
+                format='.0s'  # Short format for consistency
+            ).configure_view(
+                strokeWidth=0
+            )
         
-        fig, ax = plt.subplots(figsize=(6, 4))
-        ax.plot(x, y, 'b-', linewidth=2, label='Normal Distribution')
-        ax.fill_between(x, y, alpha=0.3, color='blue')
+        st.altair_chart(chart, use_container_width=True)
         
-        # Add mean line
-        ax.axvline(mean, color='red', linestyle='--', linewidth=2, label=f'Mean: {mean:.1f} min')
+        # Show key statistics with better styling
+        st.markdown("### 📊 Distribution Statistics")
         
-        # Add percentile lines if available
-        percentiles = stats.get("percentiles", {})
-        colors = ['green', 'orange', 'purple']
-        for i, (pct, val) in enumerate(percentiles.items()):
-            if i < len(colors):
-                ax.axvline(val, color=colors[i], linestyle=':', alpha=0.7, 
-                          label=f'{pct}: {val:.1f} min')
-        
-        ax.set_xlabel('Taxi-Out Time (minutes)')
-        ax.set_ylabel('Density')
-        ax.set_title(f'Distribution for {airport}')
-        ax.legend(fontsize=8)
-        ax.grid(True, alpha=0.3)
-        
-        st.pyplot(fig)
-        
-        # Show key statistics
-        col1, col2 = st.columns(2)
+        # Main metrics in columns
+        col1, col2, col3 = st.columns(3)
         with col1:
-            st.metric("Mean", f"{mean:.1f} min")
-            st.metric("Std Dev", f"{std:.1f} min")
+            st.metric(
+                label="📈 Mean Taxi-Out", 
+                value=f"{mean:.1f} min",
+                delta=None
+            )
         with col2:
-            st.metric("Sample Size", f"{stats.get('sample_size', 'N/A'):,}")
+            st.metric(
+                label="📊 Standard Deviation", 
+                value=f"{std:.1f} min",
+                delta=None
+            )
+        with col3:
+            sample_size = stats.get('sample_size', 'N/A')
+            if sample_size != 'N/A':
+                st.metric(
+                    label="📋 Sample Size", 
+                    value=f"{sample_size:,}",
+                    delta=None
+                )
+            else:
+                st.metric(
+                    label="📋 Sample Size", 
+                    value="N/A",
+                    delta=None
+                )
         
-        # Show percentiles
+        # Show percentiles in a more organized way
         if percentiles:
-            st.markdown("**Percentiles**")
-            for pct, val in percentiles.items():
-                st.caption(f"{pct}: {val:.1f} min")
+            st.markdown("### 📏 Percentiles")
+            pct_cols = st.columns(len(percentiles))
+            for i, (pct, val) in enumerate(percentiles.items()):
+                with pct_cols[i]:
+                    # Use a cleaner format to avoid display issues
+                    st.metric(
+                        label=f"{pct} Percentile",
+                        value=f"{val:.1f}",
+                        delta=None
+                    )
+                    st.caption("minutes")
     else:
         st.info("Distribution data not available")
         st.caption("Ensure backend is running and provides /distribution endpoint")
@@ -232,32 +443,31 @@ mode_tabs = st.tabs(["Preset Week", "Manual Scenario", "Config"])
 # Preset Week Tab
 # -----------------------------
 with mode_tabs[0]:
-    st.subheader("Preset Week")
+    st.subheader("Daily Overview")
     c1, c2 = st.columns([1, 1])
     with c1:
-        week_start = st.date_input("Week start (local)", value=pd.to_datetime("today").floor("D").date())
+        selected_date = st.date_input("Select Date (local)", value=pd.to_datetime("today").floor("D").date())
     with c2:
-        week_end = week_start + timedelta(days=6)
-        st.write(f"Week end: {week_end}")
+        st.write(f"Viewing: {selected_date}")
 
-    load_week = st.button("Load week overview", type="primary")
-    week_data: Optional[Dict[str, Any]] = None
-    if load_week:
-        with st.spinner("Loading week overview..."):
-            week_data = fetch_week_overview(st.session_state.get("api_base", DEFAULT_API_BASE), airport, start_date=str(week_start), end_date=str(week_end))
-            if week_data is None:
-                st.error("Failed to load week overview from backend.")
+    load_day = st.button("Load day overview", type="primary")
+    day_data: Optional[Dict[str, Any]] = None
+    if load_day:
+        with st.spinner("Loading day overview..."):
+            day_data = fetch_day_overview(st.session_state.get("api_base", DEFAULT_API_BASE), date=str(selected_date))
+            if day_data is None:
+                st.error("Failed to load day overview from backend.")
     # Retain in session for interactivity after button press
-    if week_data is not None:
-        st.session_state["week_data"] = week_data
+    if day_data is not None:
+        st.session_state["day_data"] = day_data
     else:
-        week_data = st.session_state.get("week_data")
+        day_data = st.session_state.get("day_data")
 
-    if week_data:
-        tz_name = week_data.get("timezone", "UTC")
-        df_bins = build_bins_dataframe(week_data)
+    if day_data:
+        tz_name = day_data.get("timezone", "UTC")
+        df_bins = build_bins_dataframe(day_data)
 
-        st.markdown("**Timeline (30‑minute bins)**")
+        st.markdown("**Timeline (10‑minute bins)**")
         states_available = sorted(df_bins["state"].astype(str).dropna().unique().tolist()) if not df_bins.empty else []
         states_to_show = st.multiselect("Filter states", options=states_available, default=states_available)
         chart = make_week_chart(df_bins, states_to_show)
@@ -363,7 +573,7 @@ with mode_tabs[0]:
                         st.subheader("Engineered Features (read‑only)")
                         engineered_feature_chips(result.get("engineered_features", {}))
     else:
-        st.info("Load a week to view the timeline and predict.")
+        st.info("Load a day to view the timeline and predict.")
 
 # -----------------------------
 # Manual Scenario Tab
@@ -445,11 +655,11 @@ with mode_tabs[2]:
     # Update the global api_base when user changes it
     if st.session_state.get("api_base_input") != st.session_state.api_base:
         st.session_state.api_base = st.session_state.api_base_input
-    
-    st.markdown("---")
-    st.markdown("### Notes")
-    st.write(
-        "- UI collects only core inputs. Engineered features are computed by the backend and displayed as read‑only.\n"
-        "- Preset Week shows a 30‑minute binned timeline fetched from the backend.\n"
-        "- For full train/serve parity, ensure backend uses the same feature pipeline as training."
-    )
+
+st.markdown("---")
+st.markdown("### Notes")
+st.write(
+    "- UI collects only core inputs. Engineered features are computed by the backend and displayed as read‑only.\n"
+    "- Preset Week shows a 10‑minute binned timeline fetched from the backend.\n"
+    "- For full train/serve parity, ensure backend uses the same feature pipeline as training."
+)
