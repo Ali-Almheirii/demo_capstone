@@ -7,4 +7,5 @@ altair>=5.0.0
 streamlit-vega-lite>=0.1.0
 scipy>=1.10.0
 plotly>=5.0.0
-streamlit-plotly-events>=0.0.6 
+streamlit-plotly-events>=0.0.6
+dash>=2.14.0 

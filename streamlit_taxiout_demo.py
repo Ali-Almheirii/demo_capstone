@@ -38,6 +38,31 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
+# Custom CSS for sticky fake sidebar
+st.markdown("""
+<style>
+.main .block-container {
+    padding-top: 1rem;
+}
+div[data-testid="column"]:first-child {
+    position: fixed;
+    top: 0;
+    left: 0;
+    width: 33.33%;
+    height: 100vh;
+    overflow-y: auto;
+    background-color: #f8f9fa;
+    padding: 1rem;
+    border-right: 1px solid #dee2e6;
+    z-index: 1000;
+}
+div[data-testid="column"]:nth-child(2) {
+    margin-left: 33.33%;
+    width: 66.67%;
+}
+</style>
+""", unsafe_allow_html=True)
+
 # -----------------------------
 # Constants and helpers
 # -----------------------------
@@ -97,6 +122,237 @@ def post_predict(api_base: str, payload: Dict[str, Any]) -> Tuple[Optional[Dict[
     except Exception as e:
         return None, str(e)
 
+
+@st.cache_data(show_spinner=False)
+def fetch_distribution(api_base: str) -> Optional[Dict[str, Any]]:
+    try:
+        url = f"{api_base.rstrip('/')}/distribution"
+        resp = requests.get(url, timeout=10)
+        if resp.status_code == 200:
+            return resp.json()
+        return None
+    except Exception:
+        return None
+
+
+def render_distribution_sidebar() -> None:
+    with st.sidebar:
+        st.header("Taxi-Out Distribution")
+        # Fixed x-axis range (0-140 minutes)
+        x_max = 140
+        # Get distribution data
+        dist_data = fetch_distribution(st.session_state.get("api_base", DEFAULT_API_BASE))
+        if dist_data:
+            stats = dist_data.get("distribution_stats", {})
+            mean = stats.get("mean", 0)
+            std = stats.get("std", 1)
+            x = np.linspace(0, x_max, 200)
+            sample_size = stats.get("sample_size", 1000)
+            y = (sample_size / (std * np.sqrt(2 * np.pi))) * np.exp(-0.5 * ((x - mean) / std) ** 2)
+            df_dist = pd.DataFrame({'taxi_time': x, 'flights': y})
+            percentiles = stats.get("percentiles", {})
+            base = alt.Chart(df_dist).encode(
+                x=alt.X('taxi_time:Q', title='Taxi-Out Time (minutes)', scale=alt.Scale(domain=[0, x_max])),
+                y=alt.Y('flights:Q', title='Number of Flights')
+            )
+            area_chart = base.mark_area(
+                fill='#4CAF50',
+                fillOpacity=0.6,
+                stroke='#2E7D32',
+                strokeWidth=2
+            )
+            mean_rule = None
+            if mean > 0:
+                mean_df = pd.DataFrame({'mean': [mean]})
+                mean_rule = alt.Chart(mean_df).mark_rule(
+                    color='#666666',
+                    strokeWidth=3,
+                    strokeDash=[5, 5]
+                ).encode(x='mean:Q')
+            layers = [area_chart]
+            if mean_rule:
+                layers.append(mean_rule)
+            pred_val = st.session_state.get("dist_predicted_min")
+            act_val = st.session_state.get("dist_actual_min")
+            marker_rows = []
+            try:
+                if isinstance(pred_val, (int, float)) and pred_val >= 0:
+                    marker_rows.append({"label": "Predicted", "value": float(pred_val)})
+            except Exception:
+                pass
+            try:
+                if isinstance(act_val, (int, float)) and act_val >= 0:
+                    marker_rows.append({"label": "Actual", "value": float(act_val)})
+            except Exception:
+                pass
+            if marker_rows:
+                markers_df = pd.DataFrame(marker_rows)
+                markers_rules = alt.Chart(markers_df).mark_rule(
+                    strokeWidth=2
+                ).encode(
+                    x='value:Q',
+                    color=alt.Color(
+                        'label:N',
+                        scale=alt.Scale(domain=['Predicted', 'Actual'], range=['#1976D2', '#D32F2F']),
+                        legend=alt.Legend(title='Markers')
+                    )
+                )
+                layers.append(markers_rules)
+            chart = alt.layer(*layers).properties(
+                title=f'Taxi-Out Time Distribution for {airport}',
+                width='container',
+                height=450
+            ).configure_axis(
+                gridColor='#e0e0e0',
+                gridOpacity=0.3,
+                labelFontSize=11,
+                titleFontSize=13
+            ).configure_view(
+                strokeWidth=0
+            ).configure_legend(
+                orient='top',
+                titleFontSize=12,
+                labelFontSize=10,
+                titleColor='#333333',
+                labelColor='#666666'
+            )
+            pred_for_key = st.session_state.get('dist_predicted_min')
+            act_for_key = st.session_state.get('dist_actual_min')
+            def _kv(v):
+                return str(int(v * 10)) if isinstance(v, (int, float)) else "x"
+            chart_key = f"dist_chart_{_kv(pred_for_key)}_{_kv(act_for_key)}"
+            st.altair_chart(chart, use_container_width=True, key=chart_key)
+            st.markdown("---")
+            st.markdown("### 📊 Distribution Statistics")
+            col1, col2 = st.columns(2)
+            with col1:
+                st.markdown("**📈 Central Tendency**")
+                st.metric(
+                    label="Mean",
+                    value=f"{mean:.1f} min",
+                    help="Average taxi-out time from real flight data"
+                )
+                st.metric(
+                    label="Median",
+                    value=f"{percentiles.get('50th', 'N/A')} min" if percentiles and '50th' in percentiles else "N/A",
+                    help="50th percentile (median) taxi-out time from real flight data"
+                )
+            with col2:
+                st.markdown("**📏 Variability**")
+                st.metric(
+                    label="Standard Deviation",
+                    value=f"{std:.1f} min",
+                    help="Measure of spread around the mean from real flight data"
+                )
+                st.metric(
+                    label="Sample Size",
+                    value=f"{stats.get('sample_size', 'N/A'):,}",
+                    help="Total number of real flights in the dataset"
+                )
+        else:
+            st.info("Distribution data not available")
+            st.caption("Ensure backend is running and provides /distribution endpoint")
+
+
+def render_distribution_top() -> None:
+    st.markdown("---")
+    st.markdown("### Taxi‑Out Distribution")
+    # Fixed x-axis range (0-140 minutes)
+    x_max = 140
+    # Get distribution data
+    dist_data = fetch_distribution(st.session_state.get("api_base", DEFAULT_API_BASE))
+    if dist_data:
+        stats = dist_data.get("distribution_stats", {})
+        mean = stats.get("mean", 0)
+        std = stats.get("std", 1)
+        x = np.linspace(0, x_max, 200)
+        sample_size = stats.get("sample_size", 1000)
+        y = (sample_size / (std * np.sqrt(2 * np.pi))) * np.exp(-0.5 * ((x - mean) / std) ** 2)
+        df_dist = pd.DataFrame({'taxi_time': x, 'flights': y})
+        percentiles = stats.get("percentiles", {})
+        base = alt.Chart(df_dist).encode(
+            x=alt.X('taxi_time:Q', title='Taxi-Out Time (minutes)', scale=alt.Scale(domain=[0, x_max])),
+            y=alt.Y('flights:Q', title='Number of Flights')
+        )
+        area_chart = base.mark_area(
+            fill='#4CAF50',
+            fillOpacity=0.6,
+            stroke='#2E7D32',
+            strokeWidth=2
+        )
+        mean_rule = None
+        if mean > 0:
+            mean_df = pd.DataFrame({'mean': [mean]})
+            mean_rule = alt.Chart(mean_df).mark_rule(
+                color='#666666',
+                strokeWidth=3,
+                strokeDash=[5, 5]
+            ).encode(x='mean:Q')
+        layers = [area_chart]
+        if mean_rule:
+            layers.append(mean_rule)
+        pred_val = st.session_state.get("dist_predicted_min")
+        act_val = st.session_state.get("dist_actual_min")
+        marker_rows = []
+        try:
+            if isinstance(pred_val, (int, float)) and pred_val >= 0:
+                marker_rows.append({"label": "Predicted", "value": float(pred_val)})
+        except Exception:
+            pass
+        try:
+            if isinstance(act_val, (int, float)) and act_val >= 0:
+                marker_rows.append({"label": "Actual", "value": float(act_val)})
+        except Exception:
+            pass
+        if marker_rows:
+            markers_df = pd.DataFrame(marker_rows)
+            markers_rules = alt.Chart(markers_df).mark_rule(
+                strokeWidth=2
+            ).encode(
+                x='value:Q',
+                color=alt.Color(
+                    'label:N',
+                    scale=alt.Scale(domain=['Predicted', 'Actual'], range=['#1976D2', '#D32F2F']),
+                    legend=alt.Legend(title='Markers')
+                )
+            )
+            layers.append(markers_rules)
+        chart = alt.layer(*layers).properties(
+            width='container',
+            height=450
+        ).configure_axis(
+            gridColor='#e0e0e0',
+            gridOpacity=0.3,
+            labelFontSize=11,
+            titleFontSize=13
+        ).configure_view(
+            strokeWidth=0
+        ).configure_legend(
+            orient='top',
+            titleFontSize=12,
+            labelFontSize=10,
+            titleColor='#333333',
+            labelColor='#666666'
+        )
+        pred_for_key = st.session_state.get('dist_predicted_min')
+        act_for_key = st.session_state.get('dist_actual_min')
+        def _kv(v):
+            return str(int(v * 10)) if isinstance(v, (int, float)) else "x"
+        chart_key = f"dist_top_{_kv(pred_for_key)}_{_kv(act_for_key)}"
+        st.altair_chart(chart, use_container_width=True, key=chart_key)
+        # Stats
+        col1, col2 = st.columns(2)
+        with col1:
+            st.markdown("**📈 Central Tendency**")
+            st.metric(label="Mean", value=f"{mean:.1f} min", help="Average taxi-out time from real flight data")
+            st.metric(label="Median", value=f"{percentiles.get('50th', 'N/A')} min" if percentiles and '50th' in percentiles else "N/A", help="50th percentile (median)")
+        with col2:
+            st.markdown("**📏 Variability**")
+            st.metric(label="Standard Deviation", value=f"{std:.1f} min", help="Spread around mean")
+            st.metric(label="Sample Size", value=f"{stats.get('sample_size', 'N/A'):,}", help="Total flights in dataset")
+    else:
+        st.info("Distribution data not available")
+        st.caption("Ensure backend is running and provides /distribution endpoint")
 
 def build_bins_dataframe(week_json: Dict[str, Any]) -> pd.DataFrame:
     bins = week_json.get("bins", [])
@@ -318,145 +574,18 @@ def engineered_feature_chips(engineered: Dict[str, Any]) -> None:
 # Default airport (can be moved to config or made dynamic)
 airport = "DXB"
 
-# -----------------------------
-# Sidebar: normal distribution
-# -----------------------------
-with st.sidebar:
-    st.header("Taxi-Out Distribution")
-    
-    # Fetch distribution data from backend
-    @st.cache_data(show_spinner=False)
-    def fetch_distribution(api_base: str) -> Optional[Dict[str, Any]]:
-        try:
-            url = f"{api_base.rstrip('/')}/distribution"
-            resp = requests.get(url, timeout=10)
-            if resp.status_code == 200:
-                return resp.json()
-            return None
-        except Exception:
-            return None
-    
-    # Fixed x-axis range (0-140 minutes)
-    x_max = 140
-    
-    # Get distribution data
-    dist_data = fetch_distribution(st.session_state.get("api_base", DEFAULT_API_BASE))
-    
-    if dist_data:
-        stats = dist_data.get("distribution_stats", {})
-        mean = stats.get("mean", 0)
-        std = stats.get("std", 1)
-        
-        # Create normal distribution plot with dynamic range
-        x = np.linspace(0, x_max, 200)
-        # Scale to number of flights (assuming sample_size from stats)
-        sample_size = stats.get("sample_size", 1000)
-        y = (sample_size / (std * np.sqrt(2 * np.pi))) * np.exp(-0.5 * ((x - mean) / std) ** 2)
-        
-        # Create DataFrame for Altair chart
-        df_dist = pd.DataFrame({
-            'taxi_time': x,
-            'flights': y
-        })
-        
-        # Get percentiles for chart lines
-        percentiles = stats.get("percentiles", {})
-        
-        # Create base chart with shared encoding
-        base = alt.Chart(df_dist).encode(
-            x=alt.X('taxi_time:Q', title='Taxi-Out Time (minutes)', scale=alt.Scale(domain=[0, x_max])),
-            y=alt.Y('flights:Q', title='Number of Flights')
-        )
-        
-        # Main distribution area
-        area_chart = base.mark_area(
-            fill='#4CAF50',
-            fillOpacity=0.6,
-            stroke='#2E7D32',
-            strokeWidth=2
-        )
-        
-        # Mean line only (grey, no legend)
-        mean_rule = None
-        if mean > 0:
-            mean_df = pd.DataFrame({'mean': [mean]})
-            mean_rule = alt.Chart(mean_df).mark_rule(
-                color='#666666',
-                strokeWidth=3,
-                strokeDash=[5, 5]
-            ).encode(x='mean:Q')
-        
-        # Combine layers (only area chart and mean line)
-        layers = [area_chart]
-        if mean_rule:
-            layers.append(mean_rule)
-        
-        chart = alt.layer(*layers).properties(
-            title=f'Taxi-Out Time Distribution for {airport}',
-            width='container',
-            height=450
-        ).configure_axis(
-            gridColor='#e0e0e0',
-            gridOpacity=0.3,
-            labelFontSize=11,
-            titleFontSize=13
-        ).configure_view(
-            strokeWidth=0
-        ).configure_legend(
-            orient='top',
-            titleFontSize=12,
-            labelFontSize=10,
-            titleColor='#333333',
-            labelColor='#666666'
-        )
-        
-        # Display the combined chart
-        st.altair_chart(chart, use_container_width=True, key="dist_chart")
-        
-        # Show key statistics in a nicely organized format
-        st.markdown("---")
-        st.markdown("### 📊 Distribution Statistics")
-        
-        # Create a more organized layout
-        col1, col2 = st.columns(2)
-        
-        with col1:
-            st.markdown("**📈 Central Tendency**")
-            st.metric(
-                label="Mean",
-                value=f"{mean:.1f} min",
-                help="Average taxi-out time from real flight data"
-            )
-
-            st.metric(
-                label="Median",
-                value=f"{percentiles.get('50th', 'N/A')} min" if percentiles and '50th' in percentiles else "N/A",
-                help="50th percentile (median) taxi-out time from real flight data"
-            )
-        
-        with col2:
-            st.markdown("**📏 Variability**")
-            st.metric(
-                label="Standard Deviation",
-                value=f"{std:.1f} min",
-                help="Measure of spread around the mean from real flight data"
-            )
-            st.metric(
-                label="Sample Size",
-                value=f"{stats.get('sample_size', 'N/A'):,}",
-                help="Total number of real flights in the dataset"
-            )
-
-    else:
-        st.info("Distribution data not available")
-        st.caption("Ensure backend is running and provides /distribution endpoint")
+## Sidebar will be rendered via render_distribution_sidebar() at the end of the script
 
 # -----------------------------
 # Main layout
 # -----------------------------
 st.title("Taxi‑Out Prediction Demo")
+fake_sidebar_col, _main_spacer = st.columns([1, 2])
+with fake_sidebar_col:
+    render_distribution_top()
 
-mode_tabs = st.tabs(["Preset Week", "Manual Scenario", "Config"])
+with _main_spacer:
+    mode_tabs = st.tabs(["Preset Week", "Manual Scenario", "Config"])
 
 # -----------------------------
 # Preset Week Tab
@@ -491,19 +620,26 @@ with mode_tabs[0]:
 
         st.markdown("**Timeline (10‑minute bins)**")
         states_available = sorted(df_bins["state"].astype(str).dropna().unique().tolist()) if not df_bins.empty else []
+        # Restrict to only Low/Medium/High per requirement (exclude Surge/Recovery)
+        allowed_states = ["Low", "Medium", "High"]
+        states_available = [s for s in states_available if s in allowed_states]
         
         # Default to showing all states, but allow user to filter
         if not states_available:
             states_to_show = []
         else:
-            # Use session state to remember filter selection
+            # Use session state to remember filter selection and sanitize defaults
             if "states_filter" not in st.session_state:
                 st.session_state.states_filter = states_available
-            
+            # Ensure defaults are valid subset of options
+            default_selection = [s for s in st.session_state.states_filter if s in states_available]
+            if not default_selection:
+                default_selection = states_available
+
             states_to_show = st.multiselect(
                 "Filter states", 
                 options=states_available, 
-                default=st.session_state.states_filter,
+                default=default_selection,
                 help="Select which traffic states to display. Leave all selected to see everything."
             )
             
@@ -740,71 +876,60 @@ with mode_tabs[0]:
                 elif result is None:
                     st.error("Prediction failed: unknown error")
                 else:
-                    st.success("Prediction completed")
-                    out_left, out_right = st.columns([1, 1])
-                    with out_left:
-                        st.subheader("Prediction Results")
-                        
-                        # Main prediction metrics
-                        col1, col2 = st.columns(2)
-                        with col1:
-                            predicted = result.get('prediction_min', '—')
-                            st.metric(
-                                "Predicted Taxi-Out", 
-                                f"{predicted} min",
-                                help="Model's prediction for taxi-out duration"
-                            )
-                        with col2:
-                            actual_min = result.get('actual_min')
-                            if actual_min is not None:
-                                st.metric(
-                                    "Actual Taxi-Out", 
-                                    f"{actual_min} min",
-                                    help="Observed taxi-out duration for this exact scenario"
-                                )
-                            else:
-                                st.metric(
-                                    "Actual Taxi-Out", 
-                                    "No matching scenario found",
-                                    help="No historical scenario was found to compare against"
-                                )
-                        
-                        # Additional metrics
-                        col3, col4 = st.columns(2)
-                        with col3:
-                            percentile = result.get('percentile_vs_week', '—')
-                            st.metric(
-                                "Percentile vs Week", 
-                                f"{percentile}",
-                                help="How this prediction compares to the week's distribution"
-                            )
-                        with col4:
-                            error_val = result.get('prediction_error')
-                            if error_val is None and predicted != '—' and actual_min is not None:
-                                try:
-                                    error_val = float(predicted) - float(actual_min)
-                                except (ValueError, TypeError):
-                                    error_val = None
-                            if isinstance(error_val, (int, float)):
-                                diff_color = "normal" if abs(error_val) <= 5 else "inverse"
-                                st.metric(
-                                    "Prediction Error", 
-                                    f"{error_val:+.1f} min",
-                                    delta_color=diff_color,
-                                    help="Predicted minus actual (positive = over-prediction)"
-                                )
-                            else:
-                                st.metric("Prediction Error", "—")
-                        
-                        # Bin information (robust to None)
-                        bin_info = result.get("bin_info")
-                        if isinstance(bin_info, dict):
-                            st.caption(f"📊 Bin: {bin_info.get('state', '—')} — departures {bin_info.get('departures_count', '—')}")
-                    with out_right:
-                        st.subheader("Engineered Features (read‑only)")
-                        engineered_feature_chips(result.get("engineered_features", {}))
+                    # Persist results for display after rerun
+                    try:
+                        st.session_state['dist_predicted_min'] = float(result.get('prediction_min'))
+                    except Exception:
+                        st.session_state['dist_predicted_min'] = None
+                    actual_min_tmp = result.get('actual_min')
+                    try:
+                        st.session_state['dist_actual_min'] = float(actual_min_tmp) if actual_min_tmp is not None else None
+                    except Exception:
+                        st.session_state['dist_actual_min'] = None
+                    st.session_state['pw_last_result'] = result
+                    st.session_state['show_pw_results'] = True
+                    st.rerun()
     else:
         st.info("Load a day to view the timeline and predict.")
+
+    # Render persisted Preset Week results (if any)
+    if st.session_state.get('show_pw_results') and st.session_state.get('pw_last_result'):
+        result = st.session_state['pw_last_result']
+        out_left, out_right = st.columns([1, 1])
+        with out_left:
+            st.subheader("Prediction Results")
+            col1, col2 = st.columns(2)
+            with col1:
+                predicted = result.get('prediction_min', '—')
+                st.metric("Predicted Taxi-Out", f"{predicted} min", help="Model's prediction for taxi-out duration")
+            with col2:
+                actual_min = result.get('actual_min')
+                if actual_min is not None:
+                    st.metric("Actual Taxi-Out", f"{actual_min} min", help="Observed taxi-out duration for this exact scenario")
+                else:
+                    st.metric("Actual Taxi-Out", "No matching scenario found", help="No historical scenario was found to compare against")
+            col3, col4 = st.columns(2)
+            with col3:
+                percentile = result.get('percentile_vs_week', '—')
+                st.metric("Percentile vs Week", f"{percentile}", help="How this prediction compares to the week's distribution")
+            with col4:
+                error_val = result.get('prediction_error')
+                if error_val is None and isinstance(predicted, (int, float)) and actual_min is not None:
+                    try:
+                        error_val = float(predicted) - float(actual_min)
+                    except (ValueError, TypeError):
+                        error_val = None
+                if isinstance(error_val, (int, float)):
+                    diff_color = "normal" if abs(error_val) <= 5 else "inverse"
+                    st.metric("Prediction Error", f"{error_val:+.1f} min", delta_color=diff_color, help="Predicted minus actual (positive = over-prediction)")
+                else:
+                    st.metric("Prediction Error", "—")
+            bin_info = result.get("bin_info")
+            if isinstance(bin_info, dict):
+                st.caption(f"📊 Bin: {bin_info.get('state', '—')} — departures {bin_info.get('departures_count', '—')}")
+        with out_right:
+            st.subheader("Engineered Features (read‑only)")
+            engineered_feature_chips(result.get("engineered_features", {}))
 
 # -----------------------------
 # Manual Scenario Tab
@@ -901,69 +1026,19 @@ with mode_tabs[1]:
         elif result is None:
             st.error("Prediction failed: unknown error")
         else:
-            st.success("Prediction completed")
-            out_left, out_right = st.columns([1, 1])
-            with out_left:
-                st.subheader("Prediction Results")
-                
-                # Main prediction metrics
-                col1, col2 = st.columns(2)
-                with col1:
-                    predicted = result.get('prediction_min', '—')
-                    st.metric(
-                        "Predicted Taxi-Out", 
-                        f"{predicted} min",
-                        help="Model's prediction for taxi-out duration"
-                    )
-                with col2:
-                    actual_min = result.get('actual_min')
-                    if actual_min is not None:
-                        st.metric(
-                            "Actual Taxi-Out", 
-                            f"{actual_min} min",
-                            help="Observed taxi-out duration for this exact scenario"
-                        )
-                    else:
-                        st.metric(
-                            "Actual Taxi-Out", 
-                            "No matching scenario found",
-                            help="No historical scenario was found to compare against"
-                        )
-                
-                # Additional metrics
-                col3, col4 = st.columns(2)
-                with col3:
-                    percentile = result.get('percentile_vs_week', '—')
-                    st.metric(
-                        "Percentile vs Week", 
-                        f"{percentile}",
-                        help="How this prediction compares to the week's distribution"
-                    )
-                with col4:
-                    error_val = result.get('prediction_error')
-                    if error_val is None and predicted != '—' and actual_min is not None:
-                        try:
-                            error_val = float(predicted) - float(actual_min)
-                        except (ValueError, TypeError):
-                            error_val = None
-                    if isinstance(error_val, (int, float)):
-                        diff_color = "normal" if abs(error_val) <= 5 else "inverse"
-                        st.metric(
-                            "Prediction Error", 
-                            f"{error_val:+.1f} min",
-                            delta_color=diff_color,
-                            help="Predicted minus actual (positive = over-prediction)"
-                        )
-                    else:
-                        st.metric("Prediction Error", "—")
-                
-                # Bin information (robust to None)
-                bin_info = result.get("bin_info")
-                if isinstance(bin_info, dict):
-                    st.caption(f"📊 Bin: {bin_info.get('state', '—')} — departures {bin_info.get('departures_count', '—')}")
-            with out_right:
-                st.subheader("Engineered Features (read‑only)")
-                engineered_feature_chips(result.get("engineered_features", {}))
+            # Persist for sidebar and results display
+            try:
+                st.session_state['dist_predicted_min'] = float(result.get('prediction_min'))
+            except Exception:
+                st.session_state['dist_predicted_min'] = None
+            actual_min_tmp = result.get('actual_min')
+            try:
+                st.session_state['dist_actual_min'] = float(actual_min_tmp) if actual_min_tmp is not None else None
+            except Exception:
+                st.session_state['dist_actual_min'] = None
+            st.session_state['manual_last_result'] = result
+            st.session_state['show_manual_results'] = True
+            st.rerun()
 
 
 # -----------------------------
@@ -972,6 +1047,44 @@ with mode_tabs[1]:
 with mode_tabs[2]:
     st.subheader("Configuration")
     
+    # Render persisted Manual Scenario results (if any)
+    if st.session_state.get('show_manual_results') and st.session_state.get('manual_last_result'):
+        result = st.session_state['manual_last_result']
+        out_left, out_right = st.columns([1, 1])
+        with out_left:
+            st.subheader("Prediction Results")
+            col1, col2 = st.columns(2)
+            with col1:
+                predicted = result.get('prediction_min', '—')
+                st.metric("Predicted Taxi-Out", f"{predicted} min", help="Model's prediction for taxi-out duration")
+            with col2:
+                actual_min = result.get('actual_min')
+                if actual_min is not None:
+                    st.metric("Actual Taxi-Out", f"{actual_min} min", help="Observed taxi-out duration for this exact scenario")
+                else:
+                    st.metric("Actual Taxi-Out", "No matching scenario found", help="No historical scenario was found to compare against")
+            col3, col4 = st.columns(2)
+            with col3:
+                percentile = result.get('percentile_vs_week', '—')
+                st.metric("Percentile vs Week", f"{percentile}", help="How this prediction compares to the week's distribution")
+            with col4:
+                error_val = result.get('prediction_error')
+                if error_val is None and isinstance(predicted, (int, float)) and actual_min is not None:
+                    try:
+                        error_val = float(predicted) - float(actual_min)
+                    except (ValueError, TypeError):
+                        error_val = None
+                if isinstance(error_val, (int, float)):
+                    diff_color = "normal" if abs(error_val) <= 5 else "inverse"
+                    st.metric("Prediction Error", f"{error_val:+.1f} min", delta_color=diff_color, help="Predicted minus actual (positive = over-prediction)")
+                else:
+                    st.metric("Prediction Error", "—")
+            bin_info = result.get("bin_info")
+            if isinstance(bin_info, dict):
+                st.caption(f"📊 Bin: {bin_info.get('state', '—')} — departures {bin_info.get('departures_count', '—')}")
+        with out_right:
+            st.subheader("Engineered Features (read‑only)")
+            engineered_feature_chips(result.get("engineered_features", {}))
     # Use session state for api_base so it can be updated and used throughout the app
     if "api_base" not in st.session_state:
         st.session_state.api_base = DEFAULT_API_BASE
@@ -981,6 +1094,8 @@ with mode_tabs[2]:
     # Update the global api_base when user changes it
     if st.session_state.get("api_base_input") != st.session_state.api_base:
         st.session_state.api_base = st.session_state.api_base_input
+
+# Distribution chart is now in the fake sidebar (left column)
 
 st.markdown("---")
 st.markdown("### Notes")
